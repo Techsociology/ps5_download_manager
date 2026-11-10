@@ -1,0 +1,143 @@
+name: Release On-Demand
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Mark as pre-release"
+        type: boolean
+        default: false
+      prerelease_type:
+        description: "Pre-release type (only used when 'Mark as pre-release' is checked)"
+        type: choice
+        options:
+          - beta
+          - alpha
+          - rc
+        default: beta
+
+env:
+  SDK_URL: https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
+  SDK_DIR: /opt/ps5-payload-sdk
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version and compute tag
+        id: version
+        env:
+          PRERELEASE: ${{ inputs.prerelease }}
+          PRE_TYPE: ${{ inputs.prerelease_type }}
+        run: |
+          VERSION=$(sed -n 's/^#define DL_VERSION *"\(.*\)".*/\1/p' include/dlmgr.h | tr -d '\r')
+          if [ -z "$VERSION" ]; then
+            echo "Error: Could not find DL_VERSION in include/dlmgr.h"
+            exit 1
+          fi
+          echo "Extracted version: $VERSION"
+
+          if [ "$PRERELEASE" = "true" ]; then
+            # next number for this version + type: v0.0.7-alpha.1, v0.0.7-alpha.2, ...
+            LAST=$(git tag -l "v${VERSION}-${PRE_TYPE}.*" | sed "s/^v${VERSION}-${PRE_TYPE}\.//" | grep -E '^[0-9]+$' | sort -n | tail -1)
+            N=$(( ${LAST:-0} + 1 ))
+            TAG="v${VERSION}-${PRE_TYPE}.${N}"
+            TITLE="${VERSION} ${PRE_TYPE} ${N}"
+          else
+            TAG="v${VERSION}"
+            TITLE="${TAG}"
+          fi
+          echo "Tag: $TAG  Title: $TITLE"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "title=${TITLE}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Aborting."
+            exit 1
+          fi
+          echo "Release $TAG does not exist. Proceeding."
+
+      - name: Install toolchain dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bash clang-18 lld-18 wget python3
+
+      - name: Install ps5-payload-sdk
+        run: |
+          wget -q -O /tmp/sdk.zip "$SDK_URL"
+          sudo unzip -q -d /opt /tmp/sdk.zip
+          ls "$SDK_DIR"
+
+      # libcurl / OpenSSL / libmicrohttpd are not part of the SDK itself; they come from the
+      # ps5-payload-dev/pacbrew-repo library bundle and end up in $SDK_DIR/target/user/homebrew.
+      - name: Install static libraries (pacbrew-repo)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ASSET=$(gh api repos/ps5-payload-dev/pacbrew-repo/releases/latest \
+            --jq '[.assets[] | select(.name | test("\\.(zip|tar\\.gz|tgz|tar\\.xz)$"))] | sort_by(.size) | last | .name')
+          echo "pacbrew assets:"; gh api repos/ps5-payload-dev/pacbrew-repo/releases/latest --jq '.assets[] | "  \(.name) (\(.size) bytes)"'
+          [ -n "$ASSET" ] && [ "$ASSET" != "null" ] || { echo "::error::no archive asset found in pacbrew-repo latest release"; exit 1; }
+          echo "using: $ASSET"
+          mkdir -p /tmp/pb && gh release download --repo ps5-payload-dev/pacbrew-repo --pattern "$ASSET" --dir /tmp/pb
+          cd /tmp/pb
+          case "$ASSET" in
+            *.zip) unzip -q "$ASSET" ;;
+            *)     tar xf "$ASSET" ;;
+          esac
+          SRC=$(find /tmp/pb -type d -path '*/target/user/homebrew' | head -1)
+          [ -n "$SRC" ] || { echo "::error::target/user/homebrew not found in $ASSET"; find /tmp/pb -maxdepth 5 -type d | head -40; exit 1; }
+          sudo mkdir -p "$SDK_DIR/target/user"
+          sudo cp -a "$SRC" "$SDK_DIR/target/user/"
+          echo "---- libraries now in $SDK_DIR/target/user/homebrew/lib ----"
+          ls "$SDK_DIR/target/user/homebrew/lib" | grep -E '^lib(curl|ssl|crypto|z|microhttpd)\.a$' || true
+          echo "---- all static libs ----"; ls "$SDK_DIR/target/user/homebrew/lib"/*.a
+          echo "---- libcurl.pc ----"; cat "$SDK_DIR/target/user/homebrew/lib/pkgconfig/libcurl.pc"
+          for f in libcurl.a libssl.a libcrypto.a libmicrohttpd.a; do
+            [ -f "$SDK_DIR/target/user/homebrew/lib/$f" ] || { echo "::error::missing $f in the pacbrew bundle"; exit 1; }
+          done
+
+      - name: Build dlmgr.elf
+        run: make SDK="$SDK_DIR"
+
+      - name: Rename ELF output
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          mv dlmgr.elf "dlmgr_${TAG}.elf"
+          echo "Built: dlmgr_${TAG}.elf"
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          TITLE="${{ steps.version.outputs.title }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            NOTES="Full Changelog: https://github.com/${{ github.repository }}/compare/$PREV_TAG...$TAG"
+          else
+            NOTES="First Release."
+          fi
+          FLAGS=""
+          if [ "$PRERELEASE" = "true" ]; then FLAGS="--prerelease"; fi
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes "$NOTES" \
+            $FLAGS \
+            "dlmgr_${TAG}.elf"

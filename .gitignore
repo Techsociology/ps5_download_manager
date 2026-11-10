@@ -1,0 +1,10 @@
+*.elf
+*.bin
+*.o
+/dlmgr.map
+/build/
+include/assets_*.h
+/lib/
+*.log
+.DS_Store
+Thumbs.db
